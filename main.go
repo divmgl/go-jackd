@@ -3,8 +3,8 @@ package jackd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -13,8 +13,9 @@ import (
 var Delimiter = []byte("\r\n")
 var MaxTubeName = 200
 
-func Dial(addr string) (*Client, error) {
-	conn, err := net.Dial("tcp", addr)
+func Dial(ctx context.Context, addr string) (*Client, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +35,7 @@ func Dial(addr string) (*Client, error) {
 	}, nil
 }
 
-func (jackd *Client) Put(body []byte, opts PutOpts) (uint32, error) {
+func (jackd *Client) Put(ctx context.Context, body []byte, opts PutOpts) (uint32, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
@@ -46,51 +47,77 @@ func (jackd *Client) Put(body []byte, opts PutOpts) (uint32, error) {
 		len(body)),
 	)
 
-	// Write the command
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetWriteDeadline(deadline)
+		defer jackd.conn.SetWriteDeadline(time.Time{})
+	}
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	if _, err := jackd.buffer.Write(command); err != nil {
 		return 0, err
 	}
-	// Write the body
 	if _, err := jackd.buffer.Write(body); err != nil {
 		return 0, err
 	}
-	// Write the delimiter
 	if _, err := jackd.buffer.Write(Delimiter); err != nil {
 		return 0, err
 	}
-	// Flush the writer
 	if err := jackd.buffer.Flush(); err != nil {
 		return 0, err
 	}
 
-	for jackd.scanner.Scan() {
-		resp := string(jackd.scanner.Bytes())
-		if err := validate(resp, []string{
-			Buried,
-			ExpectedCRLF,
-			JobTooBig,
-			Draining,
-		}); err != nil {
-			return 0, err
-		}
-
-		var id uint32 = 0
-
-		_, err := fmt.Sscanf(resp, "INSERTED %d", &id)
-		if err != nil {
-			_, err = fmt.Sscanf(resp, "BURIED %d", &id)
-			if err != nil {
-				return id, ErrBuried
-			}
-		}
-
-		return id, nil
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
 	}
 
-	return 0, jackd.scanner.Err()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+		if !jackd.scanner.Scan() {
+			err := jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			return 0, err
+		}
+	}
+
+	resp := string(jackd.scanner.Bytes())
+	if err := validate(resp, []string{
+		Buried,
+		ExpectedCRLF,
+		JobTooBig,
+		Draining,
+	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+		return 0, err
+	}
+
+	var id uint32 = 0
+
+	_, err := fmt.Sscanf(resp, "INSERTED %d", &id)
+	if err != nil {
+		_, err = fmt.Sscanf(resp, "BURIED %d", &id)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return id, ctxErr
+			}
+			return id, ErrBuried
+		}
+	}
+
+	return id, nil
 }
 
-func (jackd *Client) Use(tube string) (usingTube string, err error) {
+func (jackd *Client) Use(ctx context.Context, tube string) (usingTube string, err error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
@@ -98,77 +125,127 @@ func (jackd *Client) Use(tube string) (usingTube string, err error) {
 		return
 	}
 
-	if err = jackd.write([]byte(fmt.Sprintf("use %s\r\n", tube))); err != nil {
+	if err = jackd.write(ctx, []byte(fmt.Sprintf("use %s\r\n", tube))); err != nil {
 		return
 	}
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err = validate(resp, NoErrs); err != nil {
-			return
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
 
-		_, err = fmt.Sscanf(resp, "USING %s", &usingTube)
-		if err != nil {
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err = validate(resp, NoErrs); err != nil {
+				return
+			}
+
+			_, err = fmt.Sscanf(resp, "USING %s", &usingTube)
+			if err != nil {
+				return
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
 			return
 		}
 	}
+	if err == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
+	}
 
-	err = jackd.scanner.Err()
 	return
 }
 
-func (jackd *Client) Kick(numJobs uint32) (kicked uint32, err error) {
+func (jackd *Client) Kick(ctx context.Context, numJobs uint32) (kicked uint32, err error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err = jackd.write([]byte(fmt.Sprintf("kick %d\r\n", numJobs))); err != nil {
+	if err = jackd.write(ctx, []byte(fmt.Sprintf("kick %d\r\n", numJobs))); err != nil {
 		return
 	}
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err = validate(resp, NoErrs); err != nil {
-			return
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
 
-		_, err = fmt.Sscanf(resp, "KICKED %d", &kicked)
-		if err != nil {
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err = validate(resp, NoErrs); err != nil {
+				return
+			}
+
+			_, err = fmt.Sscanf(resp, "KICKED %d", &kicked)
+			if err != nil {
+				return
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
 			return
 		}
 	}
+	if err == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
+	}
 
-	err = jackd.scanner.Err()
 	return
 }
 
-func (jackd *Client) KickJob(id uint32) error {
+func (jackd *Client) KickJob(ctx context.Context, id uint32) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("kick-job %d\r\n", id))); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("kick-job %d\r\n", id))); err != nil {
 		return err
 	}
 
-	return jackd.expectedResponse("KICKED", []string{NotFound})
+	return jackd.expectedResponse(ctx, "KICKED", []string{NotFound})
 }
 
-func (jackd *Client) Delete(job uint32) error {
+func (jackd *Client) Delete(ctx context.Context, job uint32) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("delete %d\r\n", job))); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("delete %d\r\n", job))); err != nil {
 		return err
 	}
 
-	return jackd.expectedResponse("DELETED", []string{NotFound})
+	return jackd.expectedResponse(ctx, "DELETED", []string{NotFound})
 }
 
-func (jackd *Client) PauseTube(tube string, delay time.Duration) error {
+func (jackd *Client) PauseTube(ctx context.Context, tube string, delay time.Duration) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf(
+	if err := validateTubeName(tube); err != nil {
+		return err
+	}
+
+	if err := jackd.write(ctx, []byte(fmt.Sprintf(
 		"pause-tube %s %d\r\n",
 		tube,
 		uint32(delay.Seconds()),
@@ -176,14 +253,14 @@ func (jackd *Client) PauseTube(tube string, delay time.Duration) error {
 		return err
 	}
 
-	return jackd.expectedResponse("PAUSED", []string{NotFound})
+	return jackd.expectedResponse(ctx, "PAUSED", []string{NotFound})
 }
 
-func (jackd *Client) Release(job uint32, opts ReleaseOpts) error {
+func (jackd *Client) Release(ctx context.Context, job uint32, opts ReleaseOpts) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf(
+	if err := jackd.write(ctx, []byte(fmt.Sprintf(
 		"release %d %d %d\r\n",
 		job,
 		opts.Priority,
@@ -192,14 +269,14 @@ func (jackd *Client) Release(job uint32, opts ReleaseOpts) error {
 		return err
 	}
 
-	return jackd.expectedResponse("RELEASED", []string{Buried, NotFound})
+	return jackd.expectedResponse(ctx, "RELEASED", []string{Buried, NotFound})
 }
 
-func (jackd *Client) Bury(job uint32, priority uint32) error {
+func (jackd *Client) Bury(ctx context.Context, job uint32, priority uint32) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf(
+	if err := jackd.write(ctx, []byte(fmt.Sprintf(
 		"bury %d %d\r\n",
 		job,
 		priority,
@@ -207,21 +284,21 @@ func (jackd *Client) Bury(job uint32, priority uint32) error {
 		return err
 	}
 
-	return jackd.expectedResponse("BURIED", []string{NotFound})
+	return jackd.expectedResponse(ctx, "BURIED", []string{NotFound})
 }
 
-func (jackd *Client) Touch(job uint32) error {
+func (jackd *Client) Touch(ctx context.Context, job uint32) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("touch %d\r\n", job))); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("touch %d\r\n", job))); err != nil {
 		return err
 	}
 
-	return jackd.expectedResponse("TOUCHED", []string{NotFound})
+	return jackd.expectedResponse(ctx, "TOUCHED", []string{NotFound})
 }
 
-func (jackd *Client) Watch(tube string) (watched uint32, err error) {
+func (jackd *Client) Watch(ctx context.Context, tube string) (watched uint32, err error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
@@ -229,27 +306,50 @@ func (jackd *Client) Watch(tube string) (watched uint32, err error) {
 		return
 	}
 
-	if err = jackd.write([]byte(fmt.Sprintf("watch %s\r\n", tube))); err != nil {
+	if err = jackd.write(ctx, []byte(fmt.Sprintf("watch %s\r\n", tube))); err != nil {
 		return
 	}
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err = validate(resp, NoErrs); err != nil {
-			return
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
 
-		_, err = fmt.Sscanf(resp, "WATCHING %d", &watched)
-		if err != nil {
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err = validate(resp, NoErrs); err != nil {
+				return
+			}
+
+			_, err = fmt.Sscanf(resp, "WATCHING %d", &watched)
+			if err != nil {
+				return
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
 			return
 		}
 	}
+	if err == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
+	}
 
-	err = jackd.scanner.Err()
 	return
 }
 
-func (jackd *Client) Ignore(tube string) (watched uint32, err error) {
+func (jackd *Client) Ignore(ctx context.Context, tube string) (watched uint32, err error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
@@ -257,302 +357,567 @@ func (jackd *Client) Ignore(tube string) (watched uint32, err error) {
 		return
 	}
 
-	if err = jackd.write([]byte(fmt.Sprintf("ignore %s\r\n", tube))); err != nil {
+	if err = jackd.write(ctx, []byte(fmt.Sprintf("ignore %s\r\n", tube))); err != nil {
 		return
 	}
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err = validate(resp, []string{NotIgnored}); err != nil {
-			return
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
 
-		_, err = fmt.Sscanf(resp, "WATCHING %d", &watched)
-		if err != nil {
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err = validate(resp, []string{NotIgnored}); err != nil {
+				return
+			}
+
+			_, err = fmt.Sscanf(resp, "WATCHING %d", &watched)
+			if err != nil {
+				return
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
 			return
 		}
 	}
+	if err == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
+	}
 
-	err = jackd.scanner.Err()
 	return
 }
 
-func (jackd *Client) Reserve() (uint32, []byte, error) {
+func (jackd *Client) Reserve(ctx context.Context) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte("reserve\r\n")); err != nil {
+	if err := jackd.write(ctx, []byte("reserve\r\n")); err != nil {
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("RESERVED", []string{DeadlineSoon, TimedOut})
+	return jackd.responseJobChunk(ctx, "RESERVED", []string{DeadlineSoon, TimedOut})
 }
 
-func (jackd *Client) ReserveJob(job uint32) (uint32, []byte, error) {
+func (jackd *Client) ReserveWithTimeout(ctx context.Context, timeout time.Duration) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("reserve-job %d\r\n", job))); err != nil {
+	ctxTimeout := ctx
+
+	reqDeadline := time.Now().Add(timeout)
+	ctxDeadline, hasCtxDeadline := ctx.Deadline()
+
+	if hasCtxDeadline && ctxDeadline.Before(reqDeadline) {
+		// Context deadline is sooner, use the original context.
+	} else {
+		var cancel context.CancelFunc
+		ctxTimeout, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	if err := jackd.write(ctxTimeout, []byte(fmt.Sprintf("reserve-with-timeout %d\r\n", uint32(timeout.Seconds())))); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, ctxErr
+		}
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("RESERVED", []string{DeadlineSoon, TimedOut})
+	return jackd.responseJobChunk(ctxTimeout, "RESERVED", []string{DeadlineSoon, TimedOut})
 }
 
-func (jackd *Client) Peek(job uint32) (uint32, []byte, error) {
+func (jackd *Client) ReserveJob(ctx context.Context, job uint32) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("peek %d\r\n", job))); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("reserve-job %d\r\n", job))); err != nil {
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("FOUND", []string{NotFound})
+	return jackd.responseJobChunk(ctx, "RESERVED", []string{DeadlineSoon, TimedOut})
 }
 
-func (jackd *Client) PeekReady() (uint32, []byte, error) {
+func (jackd *Client) Peek(ctx context.Context, job uint32) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte("peek-ready\r\n")); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("peek %d\r\n", job))); err != nil {
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("FOUND", []string{NotFound})
+	return jackd.responseJobChunk(ctx, "FOUND", []string{NotFound})
 }
 
-func (jackd *Client) PeekDelayed() (uint32, []byte, error) {
+func (jackd *Client) PeekReady(ctx context.Context) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte("peek-delayed\r\n")); err != nil {
+	if err := jackd.write(ctx, []byte("peek-ready\r\n")); err != nil {
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("FOUND", []string{NotFound})
+	return jackd.responseJobChunk(ctx, "FOUND", []string{NotFound})
 }
 
-func (jackd *Client) PeekBuried() (uint32, []byte, error) {
+func (jackd *Client) PeekDelayed(ctx context.Context) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte("peek-buried\r\n")); err != nil {
+	if err := jackd.write(ctx, []byte("peek-delayed\r\n")); err != nil {
 		return 0, nil, err
 	}
 
-	return jackd.responseJobChunk("FOUND", []string{NotFound})
+	return jackd.responseJobChunk(ctx, "FOUND", []string{NotFound})
 }
 
-func (jackd *Client) StatsJob(id uint32) ([]byte, error) {
+func (jackd *Client) PeekBuried(ctx context.Context) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("stats-job %d\r\n", id))); err != nil {
+	if err := jackd.write(ctx, []byte("peek-buried\r\n")); err != nil {
+		return 0, nil, err
+	}
+
+	return jackd.responseJobChunk(ctx, "FOUND", []string{NotFound})
+}
+
+func (jackd *Client) StatsJob(ctx context.Context, id uint32) ([]byte, error) {
+	jackd.mutex.Lock()
+	defer jackd.mutex.Unlock()
+
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("stats-job %d\r\n", id))); err != nil {
 		return nil, err
 	}
 
-	return jackd.responseDataChunk([]string{NotFound})
+	return jackd.responseDataChunk(ctx, []string{NotFound})
 }
 
-func (jackd *Client) StatsTube(tubeName string) ([]byte, error) {
+func (jackd *Client) StatsTube(ctx context.Context, tubeName string) ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("stats-tube %s\r\n", tubeName))); err != nil {
+	if err := validateTubeName(tubeName); err != nil {
 		return nil, err
 	}
 
-	return jackd.responseDataChunk([]string{NotFound})
-}
-
-func (jackd *Client) Stats() ([]byte, error) {
-	jackd.mutex.Lock()
-	defer jackd.mutex.Unlock()
-
-	if err := jackd.write([]byte(fmt.Sprintf("stats\r\n"))); err != nil {
+	if err := jackd.write(ctx, []byte(fmt.Sprintf("stats-tube %s\r\n", tubeName))); err != nil {
 		return nil, err
 	}
 
-	return jackd.responseDataChunk([]string{NotFound})
+	return jackd.responseDataChunk(ctx, []string{NotFound})
 }
 
-func (jackd *Client) ListTubes() ([]byte, error) {
+func (jackd *Client) Stats(ctx context.Context) ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("list-tubes\r\n"))); err != nil {
+	if err := jackd.write(ctx, []byte("stats\r\n")); err != nil {
 		return nil, err
 	}
 
-	return jackd.responseDataChunk([]string{NotFound})
+	return jackd.responseDataChunk(ctx, []string{NotFound})
 }
 
-func (jackd *Client) ListTubeUsed() (tube string, err error) {
+func (jackd *Client) ListTubes(ctx context.Context) ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err = jackd.write([]byte(fmt.Sprintf("list-tube-used\r\n"))); err != nil {
+	if err := jackd.write(ctx, []byte("list-tubes\r\n")); err != nil {
+		return nil, err
+	}
+
+	return jackd.responseDataChunk(ctx, []string{NotFound})
+}
+
+func (jackd *Client) ListTubeUsed(ctx context.Context) (tube string, err error) {
+	jackd.mutex.Lock()
+	defer jackd.mutex.Unlock()
+
+	if err = jackd.write(ctx, []byte("list-tube-used\r\n")); err != nil {
 		return
 	}
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err = validate(resp, NoErrs); err != nil {
-			return
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
 
-		_, err = fmt.Sscanf(resp, "USING %s", &tube)
-		if err != nil {
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err = validate(resp, NoErrs); err != nil {
+				return
+			}
+
+			_, err = fmt.Sscanf(resp, "USING %s", &tube)
+			if err != nil {
+				return
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
 			return
 		}
 	}
+	if err == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
+	}
 
-	err = jackd.scanner.Err()
 	return
 }
 
-func (jackd *Client) ListTubesWatched() ([]byte, error) {
+func (jackd *Client) ListTubesWatched(ctx context.Context) ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("list-tubes-watched\r\n"))); err != nil {
+	if err := jackd.write(ctx, []byte("list-tubes-watched\r\n")); err != nil {
 		return nil, err
 	}
 
-	return jackd.responseDataChunk([]string{NotFound})
+	return jackd.responseDataChunk(ctx, []string{NotFound})
 }
 
-func (jackd *Client) Quit() error {
+func (jackd *Client) Quit(ctx context.Context) error {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte("quit\r\n")); err != nil {
+	if err := jackd.write(ctx, []byte("quit\r\n")); err != nil {
+		_ = jackd.conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 
 	return jackd.conn.Close()
 }
 
-func (jackd *Client) expectedResponse(expected string, errs []string) error {
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err := validate(resp, errs); err != nil {
+func (jackd *Client) expectedResponse(ctx context.Context, expected string, errs []string) error {
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err := validate(resp, errs); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				return err
+			}
+
+			if resp != expected {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				return unexpectedResponseError(resp)
+			}
+		} else {
+			err := jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
-
-		if resp != expected {
-			return unexpectedResponseError(resp)
+	}
+	if ctx.Err() == nil && !jackd.scanner.Scan() {
+		err := jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
 		}
+		return err
 	}
 
 	return nil
 }
 
-func (jackd *Client) responseJobChunk(expected string, errs []string) (uint32, []byte, error) {
+func (jackd *Client) responseJobChunk(ctx context.Context, expected string, errs []string) (uint32, []byte, error) {
 	var id uint32 = 0
 	var payloadLength = 0
+	var err error
+	var body []byte
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err := validate(resp, errs); err != nil {
-			return 0, nil, err
-		}
-
-		parsed, err := fmt.Sscanf(resp, expected+" %d %d", &id, &payloadLength)
-		if err != nil {
-			return 0, nil, err
-		}
-		if parsed != 2 {
-			return 0, nil, unexpectedResponseError(resp)
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
 	}
 
-	if err := jackd.scanner.Err(); err != nil {
-		return 0, nil, err
+	select {
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err := validate(resp, errs); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return 0, nil, ctxErr
+				}
+				return 0, nil, err
+			}
+
+			parsed, err := fmt.Sscanf(resp, expected+" %d %d", &id, &payloadLength)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return 0, nil, ctxErr
+				}
+				return 0, nil, err
+			}
+			if parsed != 2 {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return 0, nil, ctxErr
+				}
+				return 0, nil, unexpectedResponseError(resp)
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return id, nil, ctxErr
+			}
+			return id, nil, err
+		}
+	}
+	if ctx.Err() == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil && len(body) < payloadLength {
+			err = fmt.Errorf("connection closed prematurely while reading job body: read %d, expected %d", len(body), payloadLength)
+		} else if err == nil {
+			err = net.ErrClosed
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return id, body, ctxErr
+		}
+		return id, body, err
 	}
 
-	body := []byte("")
+	body = make([]byte, 0, payloadLength+len(Delimiter))
 
-	for jackd.scanner.Scan() {
-		body = append(body, jackd.scanner.Bytes()...)
-		if len(body) == payloadLength {
+	for {
+		select {
+		case <-ctx.Done():
+			return id, body, ctx.Err()
+		default:
+			if !jackd.scanner.Scan() {
+				err = jackd.scanner.Err()
+				if err == nil && len(body) < payloadLength {
+					err = fmt.Errorf("connection closed prematurely while reading job body: read %d, expected %d", len(body), payloadLength)
+				} else if err == nil {
+					err = net.ErrClosed
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return id, body, ctxErr
+				}
+				return id, body, err
+			}
+		}
+
+		scannedBytes := jackd.scanner.Bytes()
+		body = append(body, scannedBytes...)
+
+		if len(body) >= payloadLength {
+			if len(body) > payloadLength {
+				body = body[:payloadLength]
+			}
 			break
 		}
 		body = append(body, Delimiter...)
 	}
 
-	return id, body, jackd.scanner.Err()
-}
-
-func Must(client *Client, err error) *Client {
+	if err = ctx.Err(); err != nil {
+		return id, body, err
+	}
+	if err == nil {
+		err = jackd.scanner.Err()
+	}
 	if err != nil {
-		log.Fatalf("unable to connect to beanstalkd instance %v", err)
+		return id, body, err
 	}
 
-	return client
+	return id, body, nil
 }
 
-func (jackd *Client) responseDataChunk(errs []string) ([]byte, error) {
+func (jackd *Client) responseDataChunk(ctx context.Context, errs []string) ([]byte, error) {
 	var payloadLength = 0
+	var err error
 
-	if jackd.scanner.Scan() {
-		resp := jackd.scanner.Text()
-		if err := validate(resp, errs); err != nil {
-			return nil, err
-		}
-
-		parsed, err := fmt.Sscanf(resp, "OK %d", &payloadLength)
-		if err != nil {
-			return nil, err
-		}
-		if parsed != 1 {
-			return nil, unexpectedResponseError(resp)
-		}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetReadDeadline(deadline)
+		defer jackd.conn.SetReadDeadline(time.Time{})
 	}
 
-	if err := jackd.scanner.Err(); err != nil {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		if jackd.scanner.Scan() {
+			resp := jackd.scanner.Text()
+			if err := validate(resp, errs); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				return nil, err
+			}
+
+			parsed, err := fmt.Sscanf(resp, "OK %d", &payloadLength)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				return nil, err
+			}
+			if parsed != 1 {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				return nil, unexpectedResponseError(resp)
+			}
+		} else {
+			err = jackd.scanner.Err()
+			if err == nil {
+				err = net.ErrClosed
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, err
+		}
+	}
+	if ctx.Err() == nil && !jackd.scanner.Scan() {
+		err = jackd.scanner.Err()
+		if err == nil {
+			err = net.ErrClosed
+		}
 		return nil, err
 	}
 
-	body := []byte("")
+	body := make([]byte, 0, payloadLength+len(Delimiter))
 
-	for jackd.scanner.Scan() {
-		body = append(body, jackd.scanner.Bytes()...)
-		if len(body) == payloadLength {
+	for {
+		select {
+		case <-ctx.Done():
+			return body, ctx.Err()
+		default:
+			if !jackd.scanner.Scan() {
+				err = jackd.scanner.Err()
+				if err == nil && len(body) < payloadLength {
+					err = fmt.Errorf("connection closed prematurely while reading data chunk: read %d, expected %d", len(body), payloadLength)
+				} else if err == nil {
+					err = net.ErrClosed
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return body, ctxErr
+				}
+				return body, err
+			}
+		}
+
+		scannedBytes := jackd.scanner.Bytes()
+		body = append(body, scannedBytes...)
+
+		if len(body) >= payloadLength {
+			if len(body) > payloadLength {
+				body = body[:payloadLength]
+			}
 			break
 		}
 		body = append(body, Delimiter...)
 	}
 
-	return body, jackd.scanner.Err()
+	if err = ctx.Err(); err != nil {
+		return body, err
+	}
+	if err == nil {
+		err = jackd.scanner.Err()
+	}
+	if err != nil {
+		return body, err
+	}
+
+	return body, nil
 }
 
 var unexpectedResponseError = func(resp string) error {
 	return fmt.Errorf("unexpected response: %s", resp)
 }
 
-// Tweaked version of https://stackoverflow.com/a/37531472/1603399 that doesn't drop data
 func splitCRLF(buf []byte, atEOF bool) (advance int, token []byte, err error) {
 	if atEOF && len(buf) == 0 {
 		return 0, nil, nil
 	}
 	if i := bytes.Index(buf, Delimiter); i >= 0 {
-		// We have a full newline-terminated line.
 		return i + 2, buf[0:i], nil
 	}
-	// If we're at EOF, we have a final, non-terminated line. Return it.
 	if atEOF {
 		return len(buf), buf, nil
 	}
-	// Request more data.
 	return 0, nil, nil
 }
 
-func (jackd *Client) write(command []byte) error {
-	if _, err := jackd.buffer.Write(command); err != nil {
+func (jackd *Client) write(ctx context.Context, command []byte) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		jackd.conn.SetWriteDeadline(deadline)
+		defer jackd.conn.SetWriteDeadline(time.Time{})
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if _, err := jackd.buffer.Write(command); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if err := jackd.buffer.Flush(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	return nil

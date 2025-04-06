@@ -1,0 +1,35 @@
+name: Go Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      beanstalkd:
+        image: ghcr.io/beanstalkd/beanstalkd:latest
+        ports:
+          - 11300:11300
+        # Add health check if necessary, beanstalkd starts quickly though
+        # options: --health-cmd "beanstalkd -p 11300" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.2'
+
+    - name: Run Go tests
+      run: go test ./...
+      env:
+        # Assuming tests connect to localhost:11300 or 127.0.0.1:11300
+        # If tests require a specific env var for the host, set it here.
+        # Example: BEANSTALK_HOST: localhost
+        BEANSTALK_PORT: 11300 # Provide the port just in case 
