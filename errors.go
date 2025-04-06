@@ -6,12 +6,12 @@ import (
 )
 
 var NoErrs = make([]string, 0)
-var TubeNameTooBig = errors.New("tube name over 200 bytes")
+var ErrTubeNameTooBig = errors.New("tube name over 200 bytes")
 
 func validateTubeName(tube string) error {
 	tubeNameBytes := []byte(tube)
 	if len(tubeNameBytes) > MaxTubeName {
-		return TubeNameTooBig
+		return ErrTubeNameTooBig
 	}
 	return nil
 }

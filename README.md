@@ -1,6 +1,7 @@
 # go-jackd
 
-[![CircleCI](https://circleci.com/gh/getjackd/go-jackd/tree/master.svg?style=shield)](https://circleci.com/gh/getjackd/go-jackd/tree/master)
+[![Go Tests](https://github.com/divmgl/go-jackd/actions/workflows/test.yml/badge.svg)](https://github.com/divmgl/go-jackd/actions/workflows/test.yml)
+
 
 ```go
 package main

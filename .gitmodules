@@ -1,0 +1,3 @@
+[submodule "beanstalkd"]
+	path = beanstalkd
+	url = git@github.com:beanstalkd/beanstalkd.git
