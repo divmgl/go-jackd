@@ -63,7 +63,7 @@ func (jackd *Client) Put(body []byte, opts PutOpts) (uint32, error) {
 		return 0, err
 	}
 
-	for jackd.scanner.Scan() {
+	if jackd.scanner.Scan() {
 		resp := string(jackd.scanner.Bytes())
 		if err := validate(resp, []string{
 			Buried,
@@ -288,6 +288,19 @@ func (jackd *Client) Reserve() (uint32, []byte, error) {
 	return jackd.responseJobChunk("RESERVED", []string{DeadlineSoon, TimedOut})
 }
 
+func (jackd *Client) ReserveWithTimeout(timeout time.Duration) (uint32, []byte, error) {
+	jackd.mutex.Lock()
+	defer jackd.mutex.Unlock()
+
+	command := []byte(fmt.Sprintf("reserve-with-timeout %d\r\n", uint32(timeout.Seconds())))
+
+	if err := jackd.write(command); err != nil {
+		return 0, nil, err
+	}
+
+	return jackd.responseJobChunk("RESERVED", []string{DeadlineSoon, TimedOut})
+}
+
 func (jackd *Client) ReserveJob(job uint32) (uint32, []byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
@@ -369,7 +382,7 @@ func (jackd *Client) Stats() ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("stats\r\n"))); err != nil {
+	if err := jackd.write([]byte("stats\r\n")); err != nil {
 		return nil, err
 	}
 
@@ -380,7 +393,7 @@ func (jackd *Client) ListTubes() ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("list-tubes\r\n"))); err != nil {
+	if err := jackd.write([]byte("list-tubes\r\n")); err != nil {
 		return nil, err
 	}
 
@@ -391,7 +404,7 @@ func (jackd *Client) ListTubeUsed() (tube string, err error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err = jackd.write([]byte(fmt.Sprintf("list-tube-used\r\n"))); err != nil {
+	if err = jackd.write([]byte("list-tube-used\r\n")); err != nil {
 		return
 	}
 
@@ -415,7 +428,7 @@ func (jackd *Client) ListTubesWatched() ([]byte, error) {
 	jackd.mutex.Lock()
 	defer jackd.mutex.Unlock()
 
-	if err := jackd.write([]byte(fmt.Sprintf("list-tubes-watched\r\n"))); err != nil {
+	if err := jackd.write([]byte("list-tubes-watched\r\n")); err != nil {
 		return nil, err
 	}
 

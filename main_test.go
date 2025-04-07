@@ -63,6 +63,7 @@ func (suite *JackdSuite) TestPutJob() {
 func (suite *JackdSuite) TestReserve() {
 	payload := []byte("test job")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
+	require.NoError(suite.T(), err)
 	defer suite.beanstalkd.Delete(id)
 
 	reservedID, reservedPayload, err := suite.beanstalkd.Reserve()
@@ -76,6 +77,7 @@ func (suite *JackdSuite) TestRelease() {
 	payload := []byte("test job")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
 	defer suite.beanstalkd.Delete(id)
+	require.NoError(suite.T(), err)
 
 	reservedID, reservedPayload, err := suite.beanstalkd.Reserve()
 	require.NoError(suite.T(), err)
@@ -96,6 +98,7 @@ func (suite *JackdSuite) TestPeek() {
 	payload := []byte("test job")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
 	defer suite.beanstalkd.Delete(id)
+	require.NoError(suite.T(), err)
 
 	peekedId, peekedPayload, err := suite.beanstalkd.Peek(id)
 
@@ -108,6 +111,7 @@ func (suite *JackdSuite) TestPeekReady() {
 	payload := []byte("test job")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
 	defer suite.beanstalkd.Delete(id)
+	require.NoError(suite.T(), err)
 
 	peekedId, peekedPayload, err := suite.beanstalkd.PeekReady()
 
@@ -123,6 +127,7 @@ func (suite *JackdSuite) TestPeekDelayed() {
 
 	id, err := suite.beanstalkd.Put(payload, opts)
 	defer suite.beanstalkd.Delete(id)
+	require.NoError(suite.T(), err)
 
 	peekedId, peekedPayload, err := suite.beanstalkd.PeekDelayed()
 
@@ -177,6 +182,7 @@ func (suite *JackdSuite) TestReserveJob() {
 	payload := []byte("test job")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
 	defer suite.beanstalkd.Delete(id)
+	require.NoError(suite.T(), err)
 
 	reservedID, reservedPayload, err := suite.beanstalkd.ReserveJob(id)
 	require.NoError(suite.T(), err)
@@ -185,12 +191,30 @@ func (suite *JackdSuite) TestReserveJob() {
 	assert.Equal(suite.T(), payload, reservedPayload)
 }
 
+func (suite *JackdSuite) TestReserveWithTimeout() {
+	// Test successful reserve
+	payload := []byte("test job with timeout")
+	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
+	require.NoError(suite.T(), err)
+	defer suite.beanstalkd.Delete(id)
+
+	reservedID, reservedPayload, err := suite.beanstalkd.ReserveWithTimeout(1 * time.Second)
+	require.NoError(suite.T(), err)
+	assert.Equal(suite.T(), id, reservedID)
+	assert.Equal(suite.T(), payload, reservedPayload)
+
+	// Test timeout scenario
+	_, _, err = suite.beanstalkd2.ReserveWithTimeout(0 * time.Second)
+	assert.ErrorIs(suite.T(), err, jackd.ErrTimedOut)
+}
+
 func (suite *JackdSuite) TestReserveDelayedJob() {
 	opts := jackd.DefaultPutOpts()
 	opts.Delay = 1 * time.Second
 	payload := []byte("test delayed job")
 
 	id, err := suite.beanstalkd.Put(payload, opts)
+	require.NoError(suite.T(), err)
 	defer suite.beanstalkd.Delete(id)
 
 	reservedID, reservedPayload, err := suite.beanstalkd.Reserve()
@@ -203,6 +227,7 @@ func (suite *JackdSuite) TestReserveDelayedJob() {
 func (suite *JackdSuite) TestHandlesJobsWithNewLines() {
 	payload := []byte("test job\r\nwith line breaks")
 	id, err := suite.beanstalkd.Put(payload, jackd.DefaultPutOpts())
+	require.NoError(suite.T(), err)
 	defer suite.beanstalkd.Delete(id)
 
 	reservedID, reservedPayload, err := suite.beanstalkd.Reserve()
@@ -347,6 +372,7 @@ func (suite *JackdSuite) TestPauseTube() {
 	opts := jackd.DefaultPutOpts()
 	opts.Delay = 1 * time.Second
 	job, err := suite.beanstalkd.Put(payload, opts)
+	require.NoError(suite.T(), err)
 	defer suite.beanstalkd.Delete(job)
 
 	// Put in a job with no delay in the paused tube. Jobs going into the paused

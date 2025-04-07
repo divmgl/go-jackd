@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+- We're building a modern Beanstalkd client for Golang
+- It's a simple TCP client; it's not meant to manage connection pools
+- You can use `make test` to run tests
+- If tests fail, make sure to run `docker compose restart beanstalkd` to start from a clean slate
