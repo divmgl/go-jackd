@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	jackd "github.com/getjackd/go-jackd"
+	jackd "github.com/getjackd/go-jackd/v2"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )

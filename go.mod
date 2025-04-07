@@ -1,4 +1,4 @@
-module github.com/getjackd/go-jackd
+module github.com/getjackd/go-jackd/v2
 
 go 1.24.2
 
